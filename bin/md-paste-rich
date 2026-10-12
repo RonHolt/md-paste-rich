@@ -53,7 +53,8 @@ done
 # One run at a time. Also a safety net in case a sent key ever re-triggers the binding.
 # The clipboard writer forks and keeps serving in the background, so it must not inherit
 # fd 9 (9>&-) or it holds the lock until the clipboard changes.
-exec 9>"${XDG_RUNTIME_DIR:-/tmp}/md-paste-rich.lock"
+# Opened for append so a planted symlink at the /tmp fallback can't truncate anything.
+exec 9>>"${XDG_RUNTIME_DIR:-/tmp}/md-paste-rich.lock"
 flock -n 9 || exit 0
 
 send_key() {
@@ -87,6 +88,14 @@ if [[ $mode == paste ]]; then
   window_matches "$PASSTHROUGH_CLASSES" && pass_through 0
 fi
 
+types=$(wl-paste --list-types 2>/dev/null)
+# Never re-copy what a password manager marked sensitive: the copy would lose the hint and
+# land in clipboard history.
+if grep -qx 'x-kde-passwordManagerHint' <<<"$types"; then
+  [[ $mode == paste ]] && pass_through 0
+  exit 1
+fi
+
 original=$(wl-paste --type text --no-newline 2>/dev/null)
 if [[ -z ${original//[[:space:]]/} ]]; then
   [[ $mode == paste ]] && pass_through 0
@@ -96,7 +105,7 @@ fi
 
 # Rich content copied from a web page already carries HTML; only convert it when its
 # plain text is markdown source (e.g. markdown typed into a Google Doc).
-if [[ $mode == paste ]] && wl-paste --list-types | grep -qx 'text/html' && ! looks_like_markdown "$original"; then
+if [[ $mode == paste ]] && grep -qx 'text/html' <<<"$types" && ! looks_like_markdown "$original"; then
   pass_through 0
 fi
 
@@ -106,7 +115,9 @@ markdown=$original
 indent=$(awk 'NF { match($0, /^ */); if (min == "" || RLENGTH < min) min = RLENGTH } END { print min + 0 }' <<<"$markdown")
 (( indent > 0 )) && markdown=$(sed -E "s/^ {0,$indent}//" <<<"$markdown")
 
-extensions=(--extension table --extension strikethrough --extension autolink --extension tasklist)
+# tagfilter neuters raw <script>, <iframe>, <style> and the like in the markdown.
+extensions=(--extension table --extension strikethrough --extension autolink --extension tasklist
+  --extension tagfilter)
 # --hardbreaks keeps single line breaks, for text that is not strictly paragraph-per-line.
 html=$(cmark-gfm --unsafe --hardbreaks "${extensions[@]}" <<<"$markdown")
 

@@ -131,7 +131,14 @@ for bots), tables an aligned code block, task items ☐ / ☑.
   compositor-agnostic.
 - Tested with ClickUp, Google Docs and Slack in Brave / the Slack desktop app on
   Hyprland 0.56. Other editors may treat the HTML differently.
-- Raw HTML in the markdown is passed through as HTML.
+- Raw HTML in the markdown is passed through as HTML, except tags GitHub also filters
+  (`<script>`, `<iframe>`, `<style>`, ...), which come out as text.
+
+## Privacy
+
+Everything runs locally; nothing is sent anywhere. Clipboard content a password manager
+marks sensitive (`x-kde-passwordManagerHint`) is never converted or re-copied, so it
+doesn't end up in clipboard history.
 
 ## License
 
