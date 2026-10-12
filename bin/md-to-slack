@@ -1,0 +1,120 @@
+#!/usr/bin/python3 -I
+"""Turn cmark-gfm XML (cmark-gfm -t xml) into Slack markup for pasting into the composer.
+
+Slack's composer ignores text/html on paste and only reads plain text. It shows its own
+markup raw while composing but renders it on send: *bold*, _italic_, ~strike~, `code`,
+``` blocks, > quotes. `<url|text>` links only work from bots, so links become
+"text (url)". Headings become bold lines, bullets use • ◦ ▪ by depth, tables become an
+aligned code block.
+
+    cmark-gfm -t xml --extension table ... < in.md | md-to-slack
+"""
+import sys
+import xml.etree.ElementTree as ET
+
+NS = "{http://commonmark.org/xml/1.0}"
+BULLETS = ["•", "◦", "▪"]
+INDENT = "    "
+
+
+def tag(e):
+    return e.tag.removeprefix(NS)
+
+
+def wrap(marker, s):
+    # Slack only formats when the markers touch non-space, so keep edge spaces outside.
+    core = s.strip()
+    if not core:
+        return s
+    lead = s[: len(s) - len(s.lstrip())]
+    trail = s[len(s.rstrip()):]
+    return f"{lead}{marker}{core}{marker}{trail}"
+
+
+def inlines(e):
+    return "".join(inline(c) for c in e)
+
+
+def inline(e):
+    t = tag(e)
+    if t == "text":
+        return e.text or ""
+    if t == "code":
+        return f"`{e.text or ''}`"
+    if t == "strong":
+        return wrap("*", inlines(e))
+    if t == "emph":
+        return wrap("_", inlines(e))
+    if t == "strikethrough":
+        return wrap("~", inlines(e))
+    if t in ("link", "image"):
+        url = e.get("destination", "")
+        text = inlines(e)
+        return url if text in ("", url, url.removeprefix("mailto:")) else f"{text} ({url})"
+    if t in ("softbreak", "linebreak"):
+        return "\n"
+    if t == "html_inline":
+        return e.text or ""
+    return inlines(e)
+
+
+def plain(e):
+    return "".join(e.itertext())
+
+
+def table(e):
+    rows = [[plain(cell).strip() for cell in row] for row in e]
+    widths = [max(len(r[i]) if i < len(r) else 0 for r in rows) for i in range(max(map(len, rows)))]
+    lines = ["  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip() for r in rows]
+    if len(lines) > 1:
+        lines.insert(1, "  ".join("-" * w for w in widths))
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
+def item(e, marker, depth):
+    parts = [block(c, depth + 1) for c in e]
+    lines = "\n".join(p for p in parts if p).split("\n")
+    return "\n".join([f"{marker} {lines[0]}"] + [INDENT + l if l else l for l in lines[1:]])
+
+
+def lst(e, depth):
+    ordered = e.get("type") == "ordered"
+    n = int(e.get("start", "1"))
+    out = []
+    for i, it in enumerate(e):
+        if ordered:
+            marker = f"{n + i}."
+        else:
+            marker = BULLETS[min(depth, len(BULLETS) - 1)]
+        if tag(it) == "tasklist":
+            marker += " ☑" if it.get("completed") == "true" else " ☐"
+        out.append(item(it, marker, depth))
+    return ("\n" if e.get("tight") == "true" else "\n\n").join(out)
+
+
+def block(e, depth=0):
+    t = tag(e)
+    if t == "paragraph":
+        return inlines(e)
+    if t == "heading":
+        return wrap("*", inlines(e).replace("*", ""))
+    if t == "code_block":
+        return "```\n" + (e.text or "").rstrip("\n") + "\n```"
+    if t == "block_quote":
+        return "\n".join("> " + l for l in blocks(e, depth).split("\n"))
+    if t == "list":
+        return lst(e, depth)
+    if t == "table":
+        return table(e)
+    if t == "thematic_break":
+        return "──────────"
+    if t == "html_block":
+        return (e.text or "").rstrip("\n")
+    return blocks(e, depth)
+
+
+def blocks(e, depth=0):
+    return "\n\n".join(b for b in (block(c, depth) for c in e) if b)
+
+
+sys.stdout.write(blocks(ET.parse(sys.stdin).getroot()))

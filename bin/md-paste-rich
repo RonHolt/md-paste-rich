@@ -1,0 +1,158 @@
+#!/bin/bash
+# Paste the markdown on the clipboard as rich text (bold, italics, links, lists, code), so
+# LLM / terminal output lands formatted in ClickUp, Gmail, Google Docs, Slack, etc.
+#
+# Converts with cmark-gfm and puts both versions on the clipboard with wl-copy-multi: HTML
+# for rich-text apps, the original markdown for plain-text ones (terminals, code editors).
+# Then sends Ctrl+V to the focused window through Hyprland. Slack ignores HTML on paste,
+# so Slack gets its own markup (md-to-slack) instead, and the HTML + markdown pair is put
+# back a second later.
+#
+#   md-paste-rich          convert and paste
+#   md-paste-rich --copy   convert only (no paste)
+#   md-paste-rich --ctrl-shift-v
+#                          for a Ctrl+Shift+V binding: when there is nothing to convert,
+#                          pass Ctrl+Shift+V through (terminal paste, browser "paste as
+#                          plain text")
+#
+# Settings: ${XDG_CONFIG_HOME:-~/.config}/md-paste-rich/config (shell syntax), see README.
+mode=${1:-paste}
+passthrough=(CTRL V)
+if [[ $mode == --ctrl-shift-v ]]; then
+  mode=paste
+  passthrough=("CTRL SHIFT" V)
+fi
+
+# Window classes (space separated) that get the key untouched. Terminals are matched by
+# class and by Omarchy's "terminal" window tag.
+TERMINAL_CLASSES='com.mitchellh.ghostty Alacritty kitty foot footclient org.wezfurlong.wezterm
+  org.kde.konsole org.gnome.Console org.gnome.Terminal com.gexperts.Tilix XTerm URxvt st-256color'
+# Apps where markdown is the native format.
+PASSTHROUGH_CLASSES='md.obsidian.Obsidian'
+# Apps that only read plain text on paste and get Slack markup instead of HTML.
+SLACK_CLASSES='slack Slack'
+# Empty line between top-level blocks; rich editors drop paragraph margins on paste.
+BLANK_LINES=1
+
+config="${XDG_CONFIG_HOME:-$HOME/.config}/md-paste-rich/config"
+# shellcheck source=/dev/null
+[[ -f $config ]] && . "$config"
+
+notify() {
+  command -v notify-send >/dev/null && notify-send -u low "Rich paste" "$1"
+}
+
+for cmd in hyprctl jq wl-paste wl-copy-multi cmark-gfm md-to-slack python3; do
+  if ! command -v "$cmd" >/dev/null; then
+    notify "md-paste-rich needs $cmd"
+    echo "md-paste-rich: $cmd not found" >&2
+    exit 1
+  fi
+done
+
+# One run at a time. Also a safety net in case a sent key ever re-triggers the binding.
+# The clipboard writer forks and keeps serving in the background, so it must not inherit
+# fd 9 (9>&-) or it holds the lock until the clipboard changes.
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/md-paste-rich.lock"
+flock -n 9 || exit 0
+
+send_key() {
+  hyprctl dispatch "hl.dsp.send_key_state({ mods = \"$1\", key = \"$2\", state = \"down\" })" >/dev/null
+  sleep 0.05
+  hyprctl dispatch "hl.dsp.send_key_state({ mods = \"$1\", key = \"$2\", state = \"up\" })" >/dev/null
+}
+
+# $1 = 1 in a terminal, where the plain binding falls back to Shift+Insert, not Ctrl+V.
+pass_through() {
+  if [[ ${passthrough[0]} == CTRL ]] && (( $1 )); then send_key SHIFT Insert; else send_key "${passthrough[@]}"; fi
+  exit 0
+}
+
+window_matches() {
+  jq -e --arg classes "$1" '(.class // "") as $c | $c != "" and ([$classes | splits("\\s+")] | index($c) != null)' <<<"$window" >/dev/null
+}
+
+# Markdown markers: bold, inline code, heading, list item, link, code fence, table row,
+# quote, strikethrough.
+looks_like_markdown() {
+  grep -qE '\*\*[^*]+\*\*|`[^`]+`|^#{1,6} |^\s*([-*+]|[0-9]+\.) |\[[^]]+\]\([^)]+\)|^\s*```|^\|.*\|\s*$|^> |~~[^~]+~~' <<<"$1"
+}
+
+window=$(hyprctl activewindow -j)
+if [[ $mode == paste ]]; then
+  if jq -e '(.tags // []) | map(sub("\\*$"; "")) | index("terminal")' <<<"$window" >/dev/null ||
+    window_matches "$TERMINAL_CLASSES"; then
+    pass_through 1
+  fi
+  window_matches "$PASSTHROUGH_CLASSES" && pass_through 0
+fi
+
+original=$(wl-paste --type text --no-newline 2>/dev/null)
+if [[ -z ${original//[[:space:]]/} ]]; then
+  [[ $mode == paste ]] && pass_through 0
+  notify "Clipboard has no text"
+  exit 1
+fi
+
+# Rich content copied from a web page already carries HTML; only convert it when its
+# plain text is markdown source (e.g. markdown typed into a Google Doc).
+if [[ $mode == paste ]] && wl-paste --list-types | grep -qx 'text/html' && ! looks_like_markdown "$original"; then
+  pass_through 0
+fi
+
+# Drop the indent shared by every line (terminal copies carry a left margin), or 4+
+# spaces would turn the whole thing into a code block.
+markdown=$original
+indent=$(awk 'NF { match($0, /^ */); if (min == "" || RLENGTH < min) min = RLENGTH } END { print min + 0 }' <<<"$markdown")
+(( indent > 0 )) && markdown=$(sed -E "s/^ {0,$indent}//" <<<"$markdown")
+
+extensions=(--extension table --extension strikethrough --extension autolink --extension tasklist)
+# --hardbreaks keeps single line breaks, for text that is not strictly paragraph-per-line.
+html=$(cmark-gfm --unsafe --hardbreaks "${extensions[@]}" <<<"$markdown")
+
+if (( BLANK_LINES )); then
+  html=$(python3 -Ic '
+import re, sys
+html = sys.stdin.read()
+void = {"br", "hr", "img", "input", "meta", "col", "wbr"}
+depth, ends = 0, []
+for m in re.finditer(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)[^>]*>", html):
+    closing, name = m.group(1), m.group(2).lower()
+    if name in void:
+        if depth == 0:
+            ends.append(m.end())
+    elif closing:
+        depth -= 1
+        if depth == 0:
+            ends.append(m.end())
+    else:
+        depth += 1
+for end in reversed(ends[:-1]):
+    html = html[:end] + "\n<p><br></p>" + html[end:]
+sys.stdout.write(html)
+' <<<"$html")
+fi
+
+copy_rich() {
+  wl-copy-multi text/html=<(printf '<meta charset="utf-8">%s' "$html") \
+    text/plain=<(printf '%s' "$original") 9>&-
+}
+
+if [[ $mode == paste ]] && window_matches "$SLACK_CLASSES"; then
+  slack=$(cmark-gfm -t xml "${extensions[@]}" <<<"$markdown" | md-to-slack)
+  wl-copy-multi text/plain=<(printf '%s' "$slack") 9>&-
+  send_key CTRL V
+  # Give Slack time to read the clipboard before swapping the HTML + markdown back in.
+  sleep 1
+  copy_rich
+  exit 0
+fi
+
+copy_rich
+
+if [[ $mode == --copy ]]; then
+  notify "Markdown converted; paste anywhere"
+  exit 0
+fi
+
+send_key CTRL V
